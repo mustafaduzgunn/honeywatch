@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """HoneyWatch - multi-port honeypot + web dashboard + printable report. Run as root."""
-import os, re, ssl, json, time, base64, socket, sqlite3, secrets, hmac, subprocess, threading
+import os, re, ssl, json, time, base64, socket, sqlite3, secrets, hmac, subprocess, threading, hashlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
@@ -80,9 +80,13 @@ def ber_int(v):
     return bytes([0x02, nb]) + v.to_bytes(nb, "big")
 def gcc_block(t, content): return t.to_bytes(2, "little") + (4 + len(content)).to_bytes(2, "little") + content
 
-def mcs_connect_response(channel_ids):
+def mcs_connect_response(channel_ids, enc_method=0, enc_level=0, server_random=b"", server_cert=b""):
     core = (0x00080004).to_bytes(4, "little") + bytes(8)                               # rdpVersion 5+, requestedProtocol=0, earlyCapFlags=0
-    sec = bytes(8)                                                                      # encryptionMethod=0, encryptionLevel=0 (TLS carries security)
+    if enc_method or enc_level:
+        sec = (enc_method.to_bytes(4, "little") + enc_level.to_bytes(4, "little")
+               + (32).to_bytes(4, "little") + len(server_cert).to_bytes(4, "little") + server_random + server_cert)
+    else:
+        sec = bytes(8)                                                                  # encryptionMethod=0, encryptionLevel=0 (TLS carries security)
     n = len(channel_ids)
     net = ((1003).to_bytes(2, "little") + n.to_bytes(2, "little")
            + b"".join(c.to_bytes(2, "little") for c in channel_ids) + (b"\0\0" if n % 2 else b""))
@@ -93,31 +97,134 @@ def mcs_connect_response(channel_ids):
     tmp = bytes([0x0a, 0x01, 0x00]) + ber_int(0) + b"\x30" + ber_len(len(dp)) + dp + b"\x04" + ber_len(len(gcc)) + gcc
     return b"\x7f\x66" + ber_len(len(tmp)) + tmp
 
+# ---- legacy "Standard RDP Security" (no TLS, no NLA) ----
+# Needed to interoperate with older/bare-bones RDP clients (common in brute-force tools)
+# that only offer the original, pre-TLS RDP security layer. The two published constants
+# below are the fixed "Terminal Services" certificate-signing key from the RDP wire
+# protocol spec (MS-RDPBCGR) -- every interoperable RDP implementation embeds the same
+# values to produce a certificate legacy clients will accept; they do not protect any
+# secret, they only let a server speak this legacy dialect of the protocol.
+_TS_MODULUS = bytes.fromhex("3d3a5ebd72433ec94dbbc11e4aba5fcb3e882087eff5c1e2d7b76b9af2524595ce63656b583afeef7ce7bffe3df65c7d6c5e06091af561bb2093095f056dea87")
+_TS_PRIVEXP = bytes.fromhex("87a71932da11875558001616256568f8243ee6fae9674994cf92cc3399e80860179a129f24ddb12499c73ab80a7b0ddd350779170b519bb3c7100113e73ff35f")
+_TS_N = int.from_bytes(_TS_MODULUS, "little"); _TS_D = int.from_bytes(_TS_PRIVEXP, "little")
+
+def _is_prime(n, k=12):
+    if n < 2: return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0: return n == p
+    d = n - 1; r = 0
+    while d % 2 == 0: d //= 2; r += 1
+    for _ in range(k):
+        a = secrets.randbelow(n - 3) + 2; x = pow(a, d, n)
+        if x in (1, n - 1): continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1: break
+        else: return False
+    return True
+
+def _gen_prime(bits):
+    while True:
+        n = secrets.randbits(bits) | (1 << (bits - 1)) | 1
+        if _is_prime(n): return n
+
+def rdp_rsa_keygen(bits=512):
+    e = 65537
+    while True:
+        p, q = _gen_prime(bits // 2), _gen_prime(bits // 2)
+        if p == q: continue
+        n = p * q
+        if n.bit_length() != bits: continue
+        phi = (p - 1) * (q - 1)
+        try: d = pow(e, -1, phi)
+        except ValueError: continue
+        return n, e, d
+
+def rdp_server_certificate(n, e, keylen=64):
+    modulus = n.to_bytes(keylen, "big")[::-1]
+    pubkeyblob = ((0x31415352).to_bytes(4, "little") + (keylen + 8).to_bytes(4, "little") + (keylen * 8).to_bytes(4, "little")
+                  + (keylen - 1).to_bytes(4, "little") + e.to_bytes(4, "little") + modulus + bytes(8))
+    head = (1).to_bytes(4, "little") * 3 + (6).to_bytes(2, "little") + len(pubkeyblob).to_bytes(2, "little") + pubkeyblob
+    sighash = hashlib.md5(head).digest() + b"\x00" + b"\xff" * 45 + b"\x01"
+    sig = pow(int.from_bytes(sighash[::-1], "big"), _TS_D, _TS_N).to_bytes(64, "big")[::-1]
+    return head + (8).to_bytes(2, "little") + (len(sig) + 8).to_bytes(2, "little") + sig + bytes(8)
+
+def rdp_rsa_decrypt(enc, n, d, keylen=64):
+    p = pow(int.from_bytes(enc[::-1], "big"), d, n)
+    return p.to_bytes(keylen, "big")[::-1][:32]
+
+def rdp_salted_hash(label, secret, r1, r2):
+    sha1 = hashlib.sha1(label + secret[:48] + r1 + r2).digest()
+    return hashlib.md5(secret[:48] + sha1).digest()
+
+def rdp_gen_keys(client_random, server_random):
+    pre = client_random[:24] + server_random[:24]
+    master = b"".join(rdp_salted_hash(l, pre, client_random, server_random) for l in (b"A", b"BB", b"CCC"))
+    sess = b"".join(rdp_salted_hash(l, master, client_random, server_random) for l in (b"X", b"YY", b"ZZZ"))
+    decrypt_key = hashlib.md5(sess[32:48] + client_random + server_random).digest()   # server's RC4 decrypt key
+    return decrypt_key
+
+def rdp_rc4(key, data):
+    S = list(range(256)); j = 0
+    for i in range(256):
+        j = (j + S[i] + key[i % len(key)]) % 256; S[i], S[j] = S[j], S[i]
+    i = j = 0; out = bytearray(len(data))
+    for idx, b in enumerate(data):
+        i = (i + 1) % 256; j = (j + S[i]) % 256; S[i], S[j] = S[j], S[i]
+        out[idx] = b ^ S[(S[i] + S[j]) % 256]
+    return bytes(out)
+
+_rdp_legacy_key = {}
+def rdp_legacy_keypair():   # one server keypair, generated lazily and reused across connections
+    if not _rdp_legacy_key: _rdp_legacy_key["k"] = rdp_rsa_keygen(512)
+    return _rdp_legacy_key["k"]
+
 def rdp(c, ip, port):   # RDP over TLS (non-NLA): completes MCS/GCC so the client reaches the login prompt, then captures the Client Info PDU (domain\\user + password)
     d = c.recv(1024); m = re.search(rb"mstshash=([^\r\n]*)", d or b""); ck = m[1].decode(errors="replace") if m else ""; got = False
     try:
         neg = d[-8:] if d and len(d) >= 8 and d[-8] == 1 and d[-6:-4] == b"\x08\x00" else b""
         proto = int.from_bytes(neg[4:8], "little") if neg else 0
-        sel = 1 if proto & 1 else 0                                                     # offer TLS if supported, else plain legacy security
+        sel = 1 if proto & 1 else 0                                                     # TLS if the client offers it
+        legacy = not sel                                                                # else fall back to the original "Standard RDP Security" (RSA+RC4) layer
+        if legacy:
+            ln, le, ld = rdp_legacy_keypair(); server_random = secrets.token_bytes(32)
+            cert = rdp_server_certificate(ln, le); enc_method, enc_level = 2, 2         # 128-bit RC4, CLIENT_COMPATIBLE
+        else:
+            server_random, cert, enc_method, enc_level = b"", b"", 0, 0
         c.sendall(bytes.fromhex("03000013" "0ed000001234" "00" "02000800") + sel.to_bytes(4, "little"))
         if sel: c = TLS.wrap_socket(c, server_side=True)
         ci = rpdu(c)                                                                    # Connect Initial -- count requested channels to size our response
         i = ci.find(b"\x03\xc0"); n = int.from_bytes(ci[i + 4:i + 8], "little") if i >= 0 else 0; n = n if 0 <= n < 31 else 0
-        tpkt(c, b"\x02\xf0\x80" + mcs_connect_response(list(range(1004, 1004 + n))))
+        tpkt(c, b"\x02\xf0\x80" + mcs_connect_response(list(range(1004, 1004 + n)), enc_method, enc_level, server_random, cert))
+        decrypt_key = None
         for _ in range(40):
             q = rpdu(c)[3:]; k = q[0] >> 2
             if k == 10: tpkt(c, b"\x02\xf0\x80\x2e\x00\x00\x01")                                     # Attach User Confirm
             elif k == 14: tpkt(c, b"\x02\xf0\x80\x3e\x00" + q[1:3] + q[3:5] + q[3:5])                # Channel Join Confirm
             elif k == 25:                                                                          # Send Data Request
                 pos = 6; pos += 2 if q[pos] & 0x80 else 1; pl = q[pos:]
-                if len(pl) > 22 and int.from_bytes(pl[:2], "little") & 0x40:                       # SEC_INFO_PKT (Client Info PDU)
-                    inf = pl[4:]; cd, cu, cw = (int.from_bytes(inf[8 + 2 * j:10 + 2 * j], "little") for j in range(3)); o = 18
+                if len(pl) < 4: continue
+                flags = int.from_bytes(pl[:2], "little")
+                if legacy and flags & 0x0001:                                                      # SEC_EXCHANGE_PKT: client's RSA-encrypted random
+                    ln2 = int.from_bytes(pl[4:8], "little"); enc = pl[8:8 + (ln2 - 8)]
+                    client_random = rdp_rsa_decrypt(enc, ln, ld)
+                    decrypt_key = rdp_gen_keys(client_random, server_random)
+                elif flags & 0x0040:                                                                # SEC_INFO_PKT (Client Info PDU)
+                    body = pl[4:]
+                    if flags & 0x0008:                                                              # SEC_ENCRYPT: skip 8-byte MAC, RC4-decrypt the rest
+                        if not decrypt_key: continue
+                        inf = rdp_rc4(decrypt_key, body[8:])
+                    else:
+                        inf = body
+                    if len(inf) < 18: continue
+                    cd, cu, cw = (int.from_bytes(inf[8 + 2 * j:10 + 2 * j], "little") for j in range(3)); o = 18
                     dom = inf[o:o + cd].decode("utf-16le", "replace"); o += cd + 2
                     usr = inf[o:o + cu].decode("utf-16le", "replace"); o += cu + 2
                     pw = inf[o:o + cw].decode("utf-16le", "replace"); got = True
                     log("RDP", port, ip, ((dom + "\\") if dom else "") + (usr or ck), pw, "Brute force" if (usr or pw or ck) else "Scan/Probe", "RDP login attempt")
                     return
-    except Exception: pass
+    except Exception as _e:
+        if os.environ.get("HW_DEBUG"): print(f"RDP error from {ip}: {type(_e).__name__}: {_e}", flush=True)
     finally:
         if not got: log("RDP", port, ip, ck, "", "Brute force" if ck else "Scan/Probe", "RDP login attempt (username only)" if ck else "RDP probe")
 
