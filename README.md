@@ -115,11 +115,14 @@ yansımayabilir.)
   istemcisi) ve macOS'un resmi "Microsoft Remote Desktop" uygulaması, güvenlik
   politikaları gereği NLA olmayan sunuculara bağlanmayı reddeder — bunlarla
   test etmek istersen FreeRDP (`xfreerdp ... /sec:tls /cert:ignore`) kullan.
-- **RDP + "Standard RDP Security" (NLA de TLS de yok — ör. `ncrack` gibi bazı
-  brute-force araçları):** Bu en eski mod, sunucunun ayrıca eski tip RSA
-  sertifikası + RC4 şifreleme katmanı sunmasını gerektirir. HoneyWatch şu an
-  bunu desteklemiyor; bu modu kullanan araçlarda sadece aracın kendi sabit
-  "cookie" değeri (ör. ncrack için `hello`) görünür, şifre alanı boş kalır.
+- **RDP + "Standard RDP Security" (NLA de TLS de yok):** Bu en eski mod da artık
+  desteklenir (RSA sertifikası + RC4 ile) — gerçek bir istemciyle (`xfreerdp
+  /sec:rdp`) kullanıcı adı ve şifre eksiksiz yakalandığı doğrulanmıştır. Ancak
+  bazı brute-force araçlarının (ör. `ncrack`) kendi RDP implementasyonu bu
+  katmanı tam desteklemediği için bağlantıyı tamamlamadan takılıp kalabilir;
+  bu durumda sadece aracın kendi sabit "cookie" değeri (ör. ncrack için
+  `hello`) görünür, şifre alanı boş kalır — bu, HoneyWatch'ın değil, o aracın
+  sınırlamasıdır.
 - Konum verisi ve dashboard'daki dünya haritası için sunucunun ve dashboard'ı
   açan tarayıcının internete erişebilmesi gerekir (ip-api.com, OpenStreetMap
   kiremit sunucuları, CDN üzerinden yüklenen Leaflet/Chart.js).
